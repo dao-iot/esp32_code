@@ -10,6 +10,7 @@
 #include "driver/rmt.h"
 #include "driver/i2c.h"
 #include "esp_log.h"
+#include "throttle.h"
 
 /* ===================== CONFIG ===================== */
 #define TAG "SCOOTER"
@@ -57,6 +58,7 @@ typedef struct {
     int8_t current;
     uint8_t brake;
     uint8_t mode;
+    float throttle;
     bool valid;
     uint32_t timestamp;
 } scooter_data_t;
@@ -212,7 +214,7 @@ static void i2c_task(void *arg) {
     // Initialize buffer with a default message
     memset(i2c_tx_buffer, ' ', sizeof(i2c_tx_buffer));
     snprintf(i2c_tx_buffer, sizeof(i2c_tx_buffer), 
-             "<{\"seq\":0,\"v\":0.0,\"soc\":0,\"spd\":0.0,\"cur\":0,\"brk\":0,\"mode\":0}>");
+             "<{\"seq\":0,\"v\":0.0,\"soc\":0,\"spd\":0.0,\"cur\":0,\"brk\":0,\"mode\":0,\"th\":0.0}>");
     i2c_slave_write_buffer(I2C_PORT, (uint8_t*)i2c_tx_buffer, sizeof(i2c_tx_buffer), 0);
     
     while (1) {
@@ -228,13 +230,17 @@ static void i2c_task(void *arg) {
         if (bits & NEW_DATA_BIT) {
             // New data available - update I2C buffer
             xSemaphoreTake(data_mutex, portMAX_DELAY);
+            
+            // Always update throttle regardless of new RMT data
+            data.throttle = throttle_get_percent();
+
             if (data.valid) {
                 // Build JSON in temporary buffer first
                 char temp[128];
                 int n = snprintf(temp, sizeof(temp),
-                    "<{\"seq\":%u,\"v\":%.1f,\"soc\":%u,\"spd\":%.1f,\"cur\":%d,\"brk\":%u,\"mode\":%u}>",
+                    "<{\"seq\":%u,\"v\":%.1f,\"soc\":%u,\"spd\":%.1f,\"cur\":%d,\"brk\":%u,\"mode\":%u,\"th\":%.1f}>",
                     data.seq, data.voltage, data.soc,
-                    data.speed, data.current, data.brake, data.mode
+                    data.speed, data.current, data.brake, data.mode, data.throttle
                 );
                 
                 // Pad with spaces to fill buffer (ensures clean reads)
@@ -251,6 +257,22 @@ static void i2c_task(void *arg) {
                 i2c_writes++;
             }
             xSemaphoreGive(data_mutex);
+        } else {
+            // Even if no new RMT data, we might want to update throttle?
+            // For now, only update when some data exists or on timeout
+            xSemaphoreTake(data_mutex, portMAX_DELAY);
+            data.throttle = throttle_get_percent();
+            
+            char temp[128];
+            int n = snprintf(temp, sizeof(temp),
+                "<{\"seq\":%u,\"v\":%.1f,\"soc\":%u,\"spd\":%.1f,\"cur\":%d,\"brk\":%u,\"mode\":%u,\"th\":%.1f}>",
+                data.seq, data.voltage, data.soc,
+                data.speed, data.current, data.brake, data.mode, data.throttle
+            );
+            for (int i = n; i < sizeof(temp); i++) temp[i] = ' ';
+            memcpy(i2c_tx_buffer, temp, sizeof(i2c_tx_buffer));
+            i2c_slave_write_buffer(I2C_PORT, (uint8_t*)i2c_tx_buffer, sizeof(i2c_tx_buffer), pdMS_TO_TICKS(10));
+            xSemaphoreGive(data_mutex);
         }
     }
 }
@@ -259,8 +281,8 @@ static void i2c_task(void *arg) {
 static void status_task(void *arg) {
     while (1) {
         xSemaphoreTake(data_mutex, portMAX_DELAY);
-        ESP_LOGI(TAG, "STATUS - RMT: %lu | I2C: %lu | Seq: %u | Speed: %.1f km/h | Mode: %u | Volt: %.1fV",
-                 rmt_frames, i2c_writes, data.seq, data.speed, data.mode, data.voltage);
+        ESP_LOGI(TAG, "STATUS - RMT: %lu | I2C: %lu | Seq: %u | Speed: %.1f km/h | Mode: %u | Volt: %.1fV | Throttle: %.1f%%",
+                 rmt_frames, i2c_writes, data.seq, data.speed, data.mode, data.voltage, data.throttle);
         xSemaphoreGive(data_mutex);
         vTaskDelay(pdMS_TO_TICKS(5000));
     }
@@ -273,6 +295,7 @@ void app_main(void) {
 
     i2c_init();
     rmt_init();
+    throttle_init();
 
     ESP_LOGI(TAG, "Boot OK. I2C addr 0x%02X", I2C_SLAVE_ADDR);
 
