@@ -34,9 +34,8 @@
 /* -------- SPEED -------- */
 #define POLE_PAIRS       24
 #define HALL_PER_E_REV   6
-#define HALL_PER_W_REV   (POLE_PAIRS * HALL_PER_E_REV)
-#define WHEEL_DIAM_M     0.3048
-#define WHEEL_CIRC_M     (3.1416 * WHEEL_DIAM_M)
+#define HALL_PER_W_REV   144         // (POLE_PAIRS * HALL_PER_E_REV) as shown in screenshot
+#define WHEEL_CIRC_M     1.435       // Corrected circumference from 0.957m to 1.435m
 
 /* -------- EVENT BITS -------- */
 #define NEW_DATA_BIT     BIT0
