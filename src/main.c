@@ -119,10 +119,14 @@ static void rmt_init(void) {
 }
 
 /* ===================== DECODER TASK ===================== */
+
 static void decoder_task(void *arg) {
     ESP_LOGI(TAG, "RMT decoder started");
 
+    static uint32_t last_tick = 0;
+
     while (1) {
+
         size_t len;
         rmt_item32_t *it = xRingbufferReceive(rb, &len, pdMS_TO_TICKS(1000));
         if (!it) continue;
@@ -130,81 +134,131 @@ static void decoder_task(void *arg) {
         uint8_t raw[12] = {0};
         int bit = 0, byte = 0;
         bool have_low = false;
-        uint32_t low = 0;
+        uint32_t pulse_low = 0;
+
+        /* ================= BIT DECODING ================= */
 
         for (int i = 0; i < len / 4 && byte < 12; i++) {
+
             uint32_t d[2] = { it[i].duration0, it[i].duration1 };
             int l[2] = { it[i].level0, it[i].level1 };
 
             for (int p = 0; p < 2; p++) {
-                if (l[p] == 0) { low = d[p]; have_low = true; }
+
+                if (l[p] == 0) {
+                    pulse_low = d[p];
+                    have_low = true;
+                }
                 else if (have_low) {
+
                     uint8_t b;
-                    if (near(low, T_UNIT_US) && near(d[p], 2*T_UNIT_US)) b = 1;
-                    else if (near(low, 2*T_UNIT_US) && near(d[p], T_UNIT_US)) b = 0;
-                    else continue;
+
+                    if (near(pulse_low, T_UNIT_US) &&
+                        near(d[p], 2*T_UNIT_US))
+                        b = 1;
+                    else if (near(pulse_low, 2*T_UNIT_US) &&
+                             near(d[p], T_UNIT_US))
+                        b = 0;
+                    else
+                        continue;
 
                     raw[byte] = (raw[byte] << 1) | b;
-                    if (++bit == 8) { bit = 0; byte++; }
+
+                    if (++bit == 8) {
+                        bit = 0;
+                        byte++;
+                    }
+
                     have_low = false;
                 }
             }
         }
+
         vRingbufferReturnItem(rb, it);
-        if (byte != 12 || checksum(raw) != raw[11]) continue;
+
+        /* ================= FRAME VALIDATION ================= */
+
+        if (byte != 12 || checksum(raw) != raw[11])
+            continue;
 
         uint8_t seqL = raw[1];
         uint8_t seqH = (raw[2] >> 4) & 0x0F;
         uint8_t plus = pluscode(seqL, seqH);
 
-        uint16_t speed_raw = ((raw[7]-plus)<<8)|(raw[8]-plus);
-        float rps = (float)speed_raw / HALL_PER_W_REV / 0.5f;
-        float speed_kmh = rps * WHEEL_CIRC_M * 3.6f;
-        
-        // Sanity check: max realistic speed is 100 km/h
-        // If speed is absurd, it's likely corrupted data
-        if (speed_kmh > 100.0f || speed_kmh < 0.0f) {
-            speed_kmh = 0.0f;  // Default to 0 for bad readings
-        }
-        
+        /* ================= SPEED CALCULATION ================= */
+
+        uint16_t speed_raw =
+            ((raw[7] - plus) << 8) |
+             (raw[8] - plus);
+
+        float rps =
+            (float)speed_raw /
+            HALL_PER_W_REV /
+            0.5f;
+
+        float speed_kmh =
+            rps * WHEEL_CIRC_M * 3.6f;
+
+        /* ================= INTERVAL LOG ================= */
+
+        uint32_t now = xTaskGetTickCount();
+        uint32_t interval_ms = 0;
+
+        if (last_tick != 0)
+            interval_ms =
+                (now - last_tick) *
+                portTICK_PERIOD_MS;
+
+        last_tick = now;
+
+        ESP_LOGI(TAG,
+                 "RAW LOG | Interval: %lu ms | Raw: %u | RPS: %.2f | Speed: %.2f km/h",
+                 interval_ms,
+                 speed_raw,
+                 rps,
+                 speed_kmh);
+
+        /* ================= SANITY CHECK ================= */
+
+        if (speed_kmh > 100.0f || speed_kmh < 0.0f)
+            continue;
+
+        /* ================= OTHER DATA ================= */
+
         uint8_t mode_raw = raw[4] - plus;
         uint8_t mode_bits = mode_raw & 0x03;
         uint8_t brake = (mode_raw >> 5) & 1;
-        
-        // Scooter uses: 1=LOW, 2=MED, 3=HIGH (not 0,1,2)
-        // Map to: 0=LOW, 1=MED, 2=HIGH for display
+
         uint8_t mode;
-        if (mode_bits == 1) mode = 0;      // LOW
-        else if (mode_bits == 2) mode = 1; // MED
-        else if (mode_bits == 3) mode = 2; // HIGH
-        else mode = mode_bits;             // Unknown - keep as-is
+        if (mode_bits == 1) mode = 0;
+        else if (mode_bits == 2) mode = 1;
+        else if (mode_bits == 3) mode = 2;
+        else mode = mode_bits;
+
+        /* ================= STORE DATA ================= */
 
         xSemaphoreTake(data_mutex, portMAX_DELAY);
-        data.seq = (seqH<<8)|seqL;
-        data.voltage = (raw[9]-plus)*0.5f;
-        data.soc = (raw[10]-plus);
+
+        data.seq = (seqH << 8) | seqL;
+        data.voltage = (raw[9] - plus) * 0.5f;
+        data.soc = (raw[10] - plus);
         data.speed = speed_kmh;
-        data.current = raw[6] & 0x80 ? -(raw[6]&0x7F) : (raw[6]&0x7F);
+        data.current = raw[6] & 0x80 ?
+                       -(raw[6] & 0x7F) :
+                        (raw[6] & 0x7F);
         data.brake = brake;
         data.mode = mode;
         data.valid = true;
-        data.timestamp = xTaskGetTickCount();
+        data.timestamp = now;
+
         rmt_frames++;
-        
-        // Log mode changes for debugging (show raw mode_bits)
-        static uint8_t last_mode_bits = 0xFF;
-        if (mode_bits != last_mode_bits) {
-            ESP_LOGI(TAG, "MODE CHANGE: %u -> %u (raw_bits=%u, mapped=%u, raw4=0x%02X)", 
-                     last_mode_bits, mode_bits, mode_bits, mode, raw[4]);
-            last_mode_bits = mode_bits;
-        }
-        
+
         xSemaphoreGive(data_mutex);
-        
-        // Signal I2C task that new data is available
+
         xEventGroupSetBits(event_group, NEW_DATA_BIT);
     }
 }
+
 
 /* ===================== I2C TASK ===================== */
 static void i2c_task(void *arg) {
